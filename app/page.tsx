@@ -7,6 +7,8 @@ export const metadata: Metadata = {
     "Clear six physical-keyboard stages where the BPM and playable QWERTY zone expand, contract, slow down, and accelerate mid-sequence.",
 };
 
+export const dynamic = "force-static";
+
 export default function Home() {
   return <KeyboardDodge />;
 }

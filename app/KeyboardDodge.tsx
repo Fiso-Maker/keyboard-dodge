@@ -16,10 +16,14 @@ import {
   getBeatMs,
   getCompletedWaveCount,
   getNextWaveTiming,
+  getImpactHoldMs,
   getStage,
+  getStageDurationMs,
   getStageKeyRange,
   getStageSelectionAction,
   getStageTempoRange,
+  getZoneTransition,
+  getWaveIntensity,
   getWaveProfile,
   InputSnapshot,
   INVULNERABILITY_MS,
@@ -30,8 +34,31 @@ import {
   resolveZoneEntry,
   STAGES,
   StageId,
+  SurfPattern,
   WaveProfile,
+  ZoneTransitionPlan,
 } from "./gameLogic";
+import {
+  AudioDirector,
+  musicProfileFromWave,
+  SCORE_START_LEAD_MS,
+} from "./audioDirector";
+import { ThemeSettings } from "./ThemeSettings";
+import {
+  DEFAULT_THEME_ID,
+  getTheme,
+  type ThemeId,
+} from "./themes";
+import {
+  applyRunResult,
+  createEmptyProgress,
+  loadProgress,
+  saveProgress,
+  type LocalProgressV1,
+  type NewBestFlags,
+  type RankedRun,
+  type RunOutcome,
+} from "./progress";
 
 type Phase =
   | "title"
@@ -43,9 +70,33 @@ type Phase =
   | "lost";
 type AttackState = "idle" | "warning" | "impact";
 type HealFeedback = "idle" | "success" | "full" | "miss";
-type PausedAttackMode = "warning" | "between" | "finish";
+type PausedAttackMode =
+  | "warning"
+  | "zone-pending"
+  | "zone-warning"
+  | "between"
+  | "finish";
 type ZoneShift = "steady" | "expand" | "contract";
 type TempoShift = "steady" | "up" | "down";
+type ZoneTransitionPhase = "warning" | "applied";
+
+interface ZoneTransitionView {
+  kind: "collapse" | "restore";
+  phase: ZoneTransitionPhase;
+  keys: readonly string[];
+  nextKeyCount: number;
+}
+
+interface CollapseEjection {
+  fromKey: string;
+  toKey: string;
+  damaged: boolean;
+}
+
+interface RunReport {
+  rankedRun: RankedRun;
+  newBests: NewBestFlags;
+}
 
 interface PausedAttackSchedule {
   stageId: StageId;
@@ -53,6 +104,7 @@ interface PausedAttackSchedule {
   mode: PausedAttackMode;
   remainingMs: number;
   warningStartedAt: number;
+  zoneTransitionPlan: ZoneTransitionPlan | null;
 }
 
 function isTypingTarget(target: EventTarget | null) {
@@ -71,6 +123,33 @@ function isNativeButtonActivation(event: KeyboardEvent) {
   return Boolean(element?.closest("button, a[href]"));
 }
 
+function formatStageDuration(durationMs: number) {
+  const totalSeconds = Math.round(durationMs / 1_000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes + ":" + seconds.toString().padStart(2, "0");
+}
+
+function getRunAwardLabels(newBests: NewBestFlags) {
+  const labels: string[] = [];
+  if (newBests.firstClear) labels.push("FIRST CLEAR");
+  if (newBests.grade) labels.push("BEST RATING");
+  if (newBests.score) labels.push("HIGH SCORE");
+  if (newBests.combo) labels.push("BEST COMBO");
+  if (newBests.hp) labels.push("BEST HP");
+  if (newBests.waves) labels.push("FARTHEST RUN");
+  return labels;
+}
+
+function getBrowserStorage() {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function KeyboardDodge() {
   const [phase, setPhase] = useState<Phase>("title");
   const [selectedStageId, setSelectedStageId] = useState<StageId | null>(null);
@@ -81,18 +160,32 @@ export function KeyboardDodge() {
   const [score, setScore] = useState(0);
   const [streak, setStreak] = useState(0);
   const [bestStreak, setBestStreak] = useState(0);
+  const [comboPopStreak, setComboPopStreak] = useState<number | null>(null);
   const [completedWaves, setCompletedWaves] = useState(0);
   const [targets, setTargets] = useState<string[]>([]);
   const [attackState, setAttackState] = useState<AttackState>("idle");
   const [attackKind, setAttackKind] = useState<AttackKind>("standard");
+  const [surfPattern, setSurfPattern] = useState<SurfPattern | null>(null);
   const [specialKey, setSpecialKey] = useState<string | null>(null);
   const [healFeedback, setHealFeedback] = useState<HealFeedback>("idle");
   const [hurt, setHurt] = useState(false);
   const [muted, setMuted] = useState(false);
+  const [themeId, setThemeId] = useState<ThemeId>(DEFAULT_THEME_ID);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [waveProfile, setWaveProfile] = useState<WaveProfile | null>(null);
+  const [runtimeActiveKeys, setRuntimeActiveKeys] = useState<readonly string[]>(
+    [],
+  );
+  const [zoneTransition, setZoneTransition] =
+    useState<ZoneTransitionView | null>(null);
   const [zoneShift, setZoneShift] = useState<ZoneShift>("steady");
   const [tempoShift, setTempoShift] = useState<TempoShift>("steady");
-  const [autoRecentered, setAutoRecentered] = useState(false);
+  const [collapseEjection, setCollapseEjection] =
+    useState<CollapseEjection | null>(null);
+  const [localProgress, setLocalProgress] = useState<LocalProgressV1>(() =>
+    createEmptyProgress(),
+  );
+  const [runReport, setRunReport] = useState<RunReport | null>(null);
 
   const selectedStage = useMemo(
     () => (selectedStageId ? getStage(selectedStageId) : null),
@@ -102,20 +195,32 @@ export function KeyboardDodge() {
     () => (focusedStageId ? getStage(focusedStageId) : null),
     [focusedStageId],
   );
-  const activeKeys = waveProfile?.activeKeys ?? [];
+  const currentTheme = useMemo(() => getTheme(themeId), [themeId]);
+  const activeKeys = runtimeActiveKeys;
 
   const playerKeyRef = useRef(playerKey);
   const phaseRef = useRef(phase);
   const hpRef = useRef(hp);
+  const scoreRef = useRef(0);
+  const streakRef = useRef(0);
+  const bestStreakRef = useRef(0);
+  const progressRef = useRef(localProgress);
+  const runIdRef = useRef("");
+  const runSerialRef = useRef(0);
+  const runEndedRef = useRef(true);
   const invulnerableUntilRef = useRef(0);
   const attackIndexRef = useRef(0);
   const lastInputRef = useRef<InputSnapshot>({ key: "", at: -Infinity });
   const audioRef = useRef<AudioContext | null>(null);
+  const audioDirectorRef = useRef<AudioDirector | null>(null);
   const mutedRef = useRef(muted);
   const pausedAttackRef = useRef<PausedAttackSchedule | null>(null);
   const pausedInvulnerabilityRef = useRef(0);
   const countdownStartedAtRef = useRef(0);
   const waveProfileRef = useRef<WaveProfile | null>(null);
+  const activeKeysRef = useRef<readonly string[]>([]);
+  const stageTrackRef = useRef<HTMLDivElement | null>(null);
+  const settingsReturnFocusRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     playerKeyRef.current = playerKey;
@@ -133,14 +238,93 @@ export function KeyboardDodge() {
     mutedRef.current = muted;
   }, [muted]);
 
+  useEffect(() => {
+    const frame = window.requestAnimationFrame(() => {
+      const storage = getBrowserStorage();
+      const storedProgress = storage
+        ? loadProgress(storage)
+        : createEmptyProgress();
+      progressRef.current = storedProgress;
+      setLocalProgress(storedProgress);
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, []);
+
+  const awardScore = useCallback((points: number) => {
+    const nextScore = Math.max(0, scoreRef.current + points);
+    scoreRef.current = nextScore;
+    setScore(nextScore);
+    return nextScore;
+  }, []);
+
+  const completeRun = useCallback(
+    (
+      stageId: StageId,
+      outcome: RunOutcome,
+      runCompletedWaves: number,
+      finalScore = scoreRef.current,
+    ) => {
+      if (runEndedRef.current) return null;
+      runEndedRef.current = true;
+
+      const commit = applyRunResult(progressRef.current, {
+        runId:
+          runIdRef.current ||
+          `${stageId}-${Date.now()}-${++runSerialRef.current}`,
+        stageId,
+        outcome,
+        completedWaves: runCompletedWaves,
+        score: finalScore,
+        bestCombo: bestStreakRef.current,
+        remainingHp: hpRef.current,
+        endedAt: Date.now(),
+      });
+
+      progressRef.current = commit.progress;
+      setLocalProgress(commit.progress);
+      setRunReport({
+        rankedRun: commit.rankedRun,
+        newBests: commit.newBests,
+      });
+      const storage = getBrowserStorage();
+      if (storage) saveProgress(storage, commit.progress);
+      return commit;
+    },
+    [],
+  );
+
+  const applyTheme = useCallback((nextThemeId: ThemeId) => {
+    const nextTheme = getTheme(nextThemeId);
+    setThemeId(nextTheme.id);
+  }, []);
+
+  useEffect(() => {
+    const theme = getTheme(themeId);
+    document.documentElement.dataset.theme = theme.id;
+    document.documentElement.style.colorScheme = theme.mode;
+  }, [themeId]);
+
   useEffect(
     () => () => {
       const context = audioRef.current;
       audioRef.current = null;
       if (context && context.state !== "closed") void context.close();
+      const director = audioDirectorRef.current;
+      audioDirectorRef.current = null;
+      if (director) void director.dispose();
     },
     [],
   );
+
+  const getAudioDirector = useCallback(() => {
+    const currentDirector = audioDirectorRef.current;
+    if (currentDirector) return currentDirector;
+    const nextDirector = new AudioDirector();
+    nextDirector.setMuted(mutedRef.current);
+    audioDirectorRef.current = nextDirector;
+    return nextDirector;
+  }, []);
 
   const playTone = useCallback(
     (frequency: number, duration = 0.06, volume = 0.04) => {
@@ -151,25 +335,44 @@ export function KeyboardDodge() {
           .webkitAudioContext;
       if (!AudioContextClass) return;
 
-      const context = audioRef.current ?? new AudioContextClass();
-      audioRef.current = context;
-      if (context.state === "suspended") void context.resume();
+      let context = audioRef.current;
+      if (!context) {
+        try {
+          context = new AudioContextClass();
+          audioRef.current = context;
+        } catch {
+          return;
+        }
+      }
 
-      const oscillator = context.createOscillator();
-      const gain = context.createGain();
-      const now = context.currentTime;
-      oscillator.type = "square";
-      oscillator.frequency.setValueAtTime(frequency, now);
-      gain.gain.setValueAtTime(volume, now);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
-      oscillator.connect(gain);
-      gain.connect(context.destination);
-      oscillator.start(now);
-      oscillator.stop(now + duration);
-      oscillator.addEventListener("ended", () => {
-        oscillator.disconnect();
-        gain.disconnect();
-      });
+      const emitTone = () => {
+        if (mutedRef.current || context.state !== "running") return;
+        try {
+          const oscillator = context.createOscillator();
+          const gain = context.createGain();
+          const now = context.currentTime;
+          oscillator.type = "square";
+          oscillator.frequency.setValueAtTime(frequency, now);
+          gain.gain.setValueAtTime(volume, now);
+          gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+          oscillator.connect(gain);
+          gain.connect(context.destination);
+          oscillator.start(now);
+          oscillator.stop(now + duration);
+          oscillator.addEventListener("ended", () => {
+            oscillator.disconnect();
+            gain.disconnect();
+          });
+        } catch {
+          // Sound effects are optional and must never interrupt game state.
+        }
+      };
+
+      if (context.state === "suspended") {
+        void context.resume().then(emitTone).catch(() => undefined);
+      } else {
+        emitTone();
+      }
     },
     [],
   );
@@ -178,48 +381,76 @@ export function KeyboardDodge() {
     setMuted((value) => {
       const next = !value;
       mutedRef.current = next;
+      audioDirectorRef.current?.setMuted(next);
       return next;
     });
   }, []);
 
+  const applyActiveKeys = useCallback((keys: readonly string[]) => {
+    activeKeysRef.current = keys;
+    setRuntimeActiveKeys(keys);
+  }, []);
+
   const startStage = useCallback(
     (stageId: StageId) => {
-      const openingProfile = getWaveProfile(getStage(stageId), 0);
+      const stage = getStage(stageId);
+      const openingProfile = getWaveProfile(stage, 0);
       setSelectedStageId(stageId);
       setPlayerKey("F");
       playerKeyRef.current = "F";
       setHp(MAX_HP);
       hpRef.current = MAX_HP;
       setScore(0);
+      scoreRef.current = 0;
+      streakRef.current = 0;
       setStreak(0);
+      setComboPopStreak(null);
       setBestStreak(0);
+      bestStreakRef.current = 0;
+      setRunReport(null);
       setCompletedWaves(0);
       setTargets([]);
       setAttackState("idle");
       setAttackKind("standard");
+      setSurfPattern(null);
       setSpecialKey(null);
       setHealFeedback("idle");
       setHurt(false);
       setWaveProfile(openingProfile);
       waveProfileRef.current = openingProfile;
+      applyActiveKeys(openingProfile.activeKeys);
+      setZoneTransition(null);
       setZoneShift("steady");
       setTempoShift("steady");
-      setAutoRecentered(false);
+      setCollapseEjection(null);
       attackIndexRef.current = 0;
+      runSerialRef.current += 1;
+      runIdRef.current = `${stageId}-${Date.now()}-${runSerialRef.current}`;
+      runEndedRef.current = false;
       invulnerableUntilRef.current = 0;
       lastInputRef.current = { key: "", at: -Infinity };
       pausedAttackRef.current = null;
       pausedInvulnerabilityRef.current = 0;
-      countdownStartedAtRef.current = performance.now();
+      countdownStartedAtRef.current =
+        performance.now() + SCORE_START_LEAD_MS;
       setCountdownValue(COUNTDOWN_BEATS);
       phaseRef.current = "countdown";
       setPhase("countdown");
-      playTone(460 + stageId * 20, 0.09, 0.04);
+      void getAudioDirector().startCountdown(
+        musicProfileFromWave(
+          stageId,
+          openingProfile,
+          getWaveIntensity(stage, 0),
+        ),
+        COUNTDOWN_BEATS,
+        countdownStartedAtRef.current,
+      );
     },
-    [playTone],
+    [applyActiveKeys, getAudioDirector],
   );
 
   const showStageSelect = useCallback(() => {
+    audioDirectorRef.current?.stop();
     phaseRef.current = "select";
     setPhase("select");
     setSelectedStageId(null);
@@ -228,30 +459,41 @@ export function KeyboardDodge() {
     setHp(MAX_HP);
     hpRef.current = MAX_HP;
     setScore(0);
+    scoreRef.current = 0;
+    streakRef.current = 0;
     setStreak(0);
+    setComboPopStreak(null);
     setBestStreak(0);
+    bestStreakRef.current = 0;
+    setRunReport(null);
     setCompletedWaves(0);
     setTargets([]);
     setAttackState("idle");
     setAttackKind("standard");
+    setSurfPattern(null);
     setSpecialKey(null);
     setHealFeedback("idle");
     setHurt(false);
     setWaveProfile(null);
     waveProfileRef.current = null;
+    applyActiveKeys([]);
+    setZoneTransition(null);
     setZoneShift("steady");
     setTempoShift("steady");
-    setAutoRecentered(false);
+    setCollapseEjection(null);
     attackIndexRef.current = 0;
+    runIdRef.current = "";
+    runEndedRef.current = true;
     invulnerableUntilRef.current = 0;
     lastInputRef.current = { key: "", at: -Infinity };
     pausedAttackRef.current = null;
     pausedInvulnerabilityRef.current = 0;
     setCountdownValue(COUNTDOWN_BEATS);
     setFocusedStageId(null);
-  }, []);
+  }, [applyActiveKeys]);
 
   const showTitle = useCallback(() => {
+    audioDirectorRef.current?.stop();
     phaseRef.current = "title";
     setPhase("title");
     setSelectedStageId(null);
@@ -260,28 +502,38 @@ export function KeyboardDodge() {
     setHp(MAX_HP);
     hpRef.current = MAX_HP;
     setScore(0);
+    scoreRef.current = 0;
+    streakRef.current = 0;
     setStreak(0);
+    setComboPopStreak(null);
     setBestStreak(0);
+    bestStreakRef.current = 0;
+    setRunReport(null);
     setCompletedWaves(0);
     setTargets([]);
     setAttackState("idle");
     setAttackKind("standard");
+    setSurfPattern(null);
     setSpecialKey(null);
     setHealFeedback("idle");
     setHurt(false);
     setWaveProfile(null);
     waveProfileRef.current = null;
+    applyActiveKeys([]);
+    setZoneTransition(null);
     setZoneShift("steady");
     setTempoShift("steady");
-    setAutoRecentered(false);
+    setCollapseEjection(null);
     attackIndexRef.current = 0;
+    runIdRef.current = "";
+    runEndedRef.current = true;
     invulnerableUntilRef.current = 0;
     lastInputRef.current = { key: "", at: -Infinity };
     pausedAttackRef.current = null;
     pausedInvulnerabilityRef.current = 0;
     setCountdownValue(COUNTDOWN_BEATS);
     setFocusedStageId(null);
-  }, []);
+  }, [applyActiveKeys]);
 
   const enterStageSelect = useCallback(() => {
     showStageSelect();
@@ -292,9 +544,19 @@ export function KeyboardDodge() {
     (stageId: StageId) => {
       setFocusedStageId(stageId);
       playTone(260 + stageId * 70, 0.06, 0.025);
-      document
-        .querySelector<HTMLButtonElement>(`[data-stage-id="${stageId}"]`)
-        ?.focus();
+      const stageCard = stageTrackRef.current?.querySelector<HTMLButtonElement>(
+        `[data-stage-id="${stageId}"]`,
+      );
+      if (!stageCard) return;
+
+      stageCard.focus({ preventScroll: true });
+      stageCard.scrollIntoView({
+        behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches
+          ? "auto"
+          : "smooth",
+        block: "nearest",
+        inline: "center",
+      });
     },
     [playTone],
   );
@@ -311,6 +573,7 @@ export function KeyboardDodge() {
   );
 
   const cancelCountdown = useCallback(() => {
+    audioDirectorRef.current?.stop();
     phaseRef.current = "select";
     setPhase("select");
     setSelectedStageId(null);
@@ -319,20 +582,29 @@ export function KeyboardDodge() {
     setTargets([]);
     setAttackState("idle");
     setAttackKind("standard");
+    setSurfPattern(null);
     setSpecialKey(null);
     setHealFeedback("idle");
     setHurt(false);
     setWaveProfile(null);
     waveProfileRef.current = null;
+    applyActiveKeys([]);
+    setZoneTransition(null);
     setZoneShift("steady");
     setTempoShift("steady");
-    setAutoRecentered(false);
-  }, []);
+    setCollapseEjection(null);
+  }, [applyActiveKeys]);
 
   const moveTo = useCallback(
     (key: string) => {
-      if (phaseRef.current !== "running" || !selectedStageId) return;
-      if (!waveProfileRef.current?.activeKeys.includes(key)) return;
+      const currentPhase = phaseRef.current;
+      if (
+        (currentPhase !== "running" && currentPhase !== "countdown") ||
+        !selectedStageId
+      ) {
+        return;
+      }
+      if (!activeKeysRef.current.includes(key)) return;
 
       lastInputRef.current = { key, at: performance.now() };
       if (playerKeyRef.current !== key) {
@@ -348,9 +620,22 @@ export function KeyboardDodge() {
     invulnerableUntilRef.current =
       performance.now() + pausedInvulnerabilityRef.current;
     pausedInvulnerabilityRef.current = 0;
+    const profile = waveProfileRef.current;
+    if (selectedStageId && profile) {
+      const stage = getStage(selectedStageId);
+      void audioDirectorRef.current?.resume(
+        musicProfileFromWave(
+          selectedStageId,
+          profile,
+          getWaveIntensity(stage, profile.waveIndex),
+        ),
+      );
+    } else {
+      void audioDirectorRef.current?.resume();
+    }
     phaseRef.current = "running";
     setPhase("running");
-  }, []);
+  }, [selectedStageId]);
 
   const pauseGame = useCallback(() => {
     pausedInvulnerabilityRef.current = Math.max(
@@ -359,10 +644,39 @@ export function KeyboardDodge() {
     );
     phaseRef.current = "paused";
     setPhase("paused");
+    setComboPopStreak(null);
+    void audioDirectorRef.current?.pause();
+  }, []);
+
+  const openThemeSettings = useCallback(() => {
+    if (phaseRef.current === "countdown") return;
+    if (phaseRef.current === "running") pauseGame();
+    settingsReturnFocusRef.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    setSettingsOpen(true);
+  }, [pauseGame]);
+
+  const closeThemeSettings = useCallback(() => {
+    setSettingsOpen(false);
+    const returnTarget = settingsReturnFocusRef.current;
+    settingsReturnFocusRef.current = null;
+    window.requestAnimationFrame(() => {
+      if (returnTarget?.isConnected) returnTarget.focus();
+    });
   }, []);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (settingsOpen) {
+        if (event.code === "Escape") {
+          event.preventDefault();
+          closeThemeSettings();
+        }
+        return;
+      }
+
       if (
         event.repeat ||
         event.isComposing ||
@@ -406,13 +720,9 @@ export function KeyboardDodge() {
         ) {
           event.preventDefault();
           const delta =
-            event.code === "ArrowRight"
+            event.code === "ArrowRight" || event.code === "ArrowDown"
               ? 1
-              : event.code === "ArrowLeft"
-                ? -1
-                : event.code === "ArrowDown"
-                  ? 3
-                  : -3;
+              : -1;
           if (!focusedStageId) {
             focusStage(
               delta > 0 ? STAGES[0].id : STAGES[STAGES.length - 1].id,
@@ -437,7 +747,16 @@ export function KeyboardDodge() {
       }
 
       if (phaseRef.current === "countdown") {
-        if (event.code === "Escape") cancelCountdown();
+        if (event.code === "Escape") {
+          cancelCountdown();
+          return;
+        }
+
+        const key = event.code.startsWith("Key") ? event.code.slice(3) : "";
+        if (ALL_KEYS.includes(key)) {
+          event.preventDefault();
+          moveTo(key);
+        }
         return;
       }
 
@@ -500,6 +819,7 @@ export function KeyboardDodge() {
     };
   }, [
     cancelCountdown,
+    closeThemeSettings,
     chooseStage,
     focusedStageId,
     enterStageSelect,
@@ -509,6 +829,7 @@ export function KeyboardDodge() {
     playTone,
     resumeGame,
     selectedStageId,
+    settingsOpen,
     showTitle,
     startStage,
     toggleMuted,
@@ -529,11 +850,6 @@ export function KeyboardDodge() {
 
       if (currentValue > 0) {
         setCountdownValue(currentValue);
-        playTone(
-          460 + stage.id * 20 + (COUNTDOWN_BEATS - currentValue) * 110,
-          0.09,
-          0.04,
-        );
         nextBeatAt += beatMs;
         timer = window.setTimeout(
           advanceCountdown,
@@ -542,7 +858,14 @@ export function KeyboardDodge() {
         return;
       }
 
-      playTone(920 + stage.id * 45, 0.14, 0.05);
+      const openingProfile = getWaveProfile(stage, 0);
+      void audioDirectorRef.current?.startRun(
+        musicProfileFromWave(
+          stage.id,
+          openingProfile,
+          getWaveIntensity(stage, 0),
+        ),
+      );
       phaseRef.current = "running";
       setPhase("running");
     };
@@ -556,7 +879,7 @@ export function KeyboardDodge() {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [phase, playTone, selectedStageId]);
+  }, [phase, selectedStageId]);
 
   useEffect(() => {
     if (phase !== "running" || !selectedStageId) return;
@@ -571,6 +894,7 @@ export function KeyboardDodge() {
     let scheduleDeadlineAt = 0;
     let warningStartedAt = -Infinity;
     let visualToken = 0;
+    let currentZonePlan: ZoneTransitionPlan | null = null;
     let nextImpactAt =
       performance.now() +
       getWaveProfile(stage, attackIndexRef.current).beatMs;
@@ -578,24 +902,17 @@ export function KeyboardDodge() {
     const finishStage = () => {
       if (cancelled || phaseRef.current !== "running") return;
       scheduleMode = null;
+      audioDirectorRef.current?.stop();
+      const finalScore = awardScore(hpRef.current * 300 + stage.id * 500);
+      completeRun(stage.id, "cleared", stage.waves, finalScore);
       phaseRef.current = "won";
-      setScore((value) => value + hpRef.current * 300 + stage.id * 500);
+      setComboPopStreak(null);
       setPhase("won");
       playTone(880 + stage.id * 80, 0.28, 0.06);
     };
 
-    const runAttack = (restoredWarningStartedAt?: number) => {
-      if (cancelled || phaseRef.current !== "running") return;
-      const waveIndex = attackIndexRef.current;
-      const profile = getWaveProfile(stage, waveIndex);
+    const updateProfile = (profile: WaveProfile) => {
       const previousProfile = waveProfileRef.current;
-      const nextZoneShift: ZoneShift = previousProfile
-        ? profile.activeKeys.length > previousProfile.activeKeys.length
-          ? "expand"
-          : profile.activeKeys.length < previousProfile.activeKeys.length
-            ? "contract"
-            : "steady"
-        : "steady";
       const nextTempoShift: TempoShift = previousProfile
         ? profile.bpm > previousProfile.bpm
           ? "up"
@@ -603,24 +920,217 @@ export function KeyboardDodge() {
             ? "down"
             : "steady"
         : "steady";
-      const zoneEntry = resolveZoneEntry(
-        playerKeyRef.current,
-        profile.activeKeys,
-      );
-      const mustRecenter = zoneEntry.recentered;
 
       waveProfileRef.current = profile;
       setWaveProfile(profile);
-      setZoneShift(nextZoneShift);
       setTempoShift(nextTempoShift);
-      setAutoRecentered(mustRecenter);
-      if (mustRecenter) {
-        playerKeyRef.current = zoneEntry.playerKey;
-        setPlayerKey(zoneEntry.playerKey);
-        lastInputRef.current = { key: "", at: -Infinity };
+      audioDirectorRef.current?.sync(
+        musicProfileFromWave(
+          stage.id,
+          profile,
+          getWaveIntensity(stage, profile.waveIndex),
+        ),
+      );
+    };
+
+    function beginZoneTransition(
+      plan: ZoneTransitionPlan,
+      restoredRemainingMs = plan.warningMs,
+      shouldRephaseScore = true,
+    ) {
+      if (cancelled || phaseRef.current !== "running") return;
+      if (plan.kind === "none") return;
+
+      const profile = getWaveProfile(stage, plan.waveIndex);
+      const transitionKeys =
+        plan.kind === "collapse"
+          ? plan.collapsingKeys
+          : plan.restoringKeys;
+      const transitionKind = plan.kind;
+      const now = performance.now();
+      const applyAt = now + Math.max(0, restoredRemainingMs);
+
+      currentZonePlan = plan;
+      updateProfile(profile);
+      if (shouldRephaseScore) {
+        audioDirectorRef.current?.rephase(
+          musicProfileFromWave(
+            stage.id,
+            profile,
+            getWaveIntensity(stage, profile.waveIndex),
+          ),
+        );
+      }
+      setZoneShift(transitionKind === "collapse" ? "contract" : "expand");
+      setCollapseEjection(null);
+      setZoneTransition({
+        kind: transitionKind,
+        phase: "warning",
+        keys: transitionKeys,
+        nextKeyCount: plan.toKeys.length,
+      });
+      playTone(
+        transitionKind === "collapse" ? 126 : 540,
+        transitionKind === "collapse" ? 0.18 : 0.14,
+        0.04,
+      );
+
+      scheduleMode = "zone-warning";
+      scheduleDeadlineAt = applyAt;
+      nextTimer = window.setTimeout(() => {
+        if (cancelled || phaseRef.current !== "running") return;
+
+        const playerKeyAtApply = playerKeyRef.current;
+        const zoneEntry = resolveZoneEntry(
+          playerKeyAtApply,
+          plan.toKeys,
+        );
+        const playerWasCollapsed =
+          transitionKind === "collapse" &&
+          plan.collapsingKeys.includes(playerKeyAtApply);
+        let fatal = false;
+
+        if (playerWasCollapsed) {
+          const collision = resolveCollision(
+            plan.collapsingKeys,
+            playerKeyAtApply,
+            performance.now(),
+            invulnerableUntilRef.current,
+          );
+
+          if (collision.damaged) {
+            invulnerableUntilRef.current = collision.invulnerableUntil;
+            const nextHp = Math.max(0, hpRef.current - 1);
+            hpRef.current = nextHp;
+            setHp(nextHp);
+            setHurt(true);
+            streakRef.current = 0;
+            setStreak(0);
+            setComboPopStreak(null);
+            fatal = nextHp === 0;
+            window.clearTimeout(hurtTimer);
+            hurtTimer = window.setTimeout(
+              () => setHurt(false),
+              INVULNERABILITY_MS,
+            );
+          }
+
+          setCollapseEjection({
+            fromKey: playerKeyAtApply,
+            toKey: zoneEntry.playerKey,
+            damaged: collision.damaged,
+          });
+        } else {
+          setCollapseEjection(null);
+        }
+
+        applyActiveKeys(plan.toKeys);
+        if (zoneEntry.recentered) {
+          playerKeyRef.current = zoneEntry.playerKey;
+          setPlayerKey(zoneEntry.playerKey);
+          lastInputRef.current = { key: "", at: -Infinity };
+        }
+
+        setZoneTransition({
+          kind: transitionKind,
+          phase: "applied",
+          keys: transitionKeys,
+          nextKeyCount: plan.toKeys.length,
+        });
+        playTone(
+          transitionKind === "collapse" ? 74 : 760,
+          0.16,
+          0.045,
+        );
+        currentZonePlan = null;
+
+        if (fatal) {
+          scheduleMode = null;
+          audioDirectorRef.current?.stop();
+          completeRun(
+            stage.id,
+            "game-over",
+            attackIndexRef.current,
+          );
+          phaseRef.current = "lost";
+          setPhase("lost");
+          playTone(55, 0.35, 0.06);
+          return;
+        }
+
+        const warningAt =
+          applyAt +
+          Math.max(0, profile.attackBeats - 1) * profile.beatMs;
+        nextImpactAt = warningAt + profile.beatMs;
+        scheduleMode = "between";
+        scheduleDeadlineAt = warningAt;
+        nextTimer = window.setTimeout(
+          () => runAttack(),
+          Math.max(0, warningAt - performance.now()),
+        );
+      }, Math.max(0, applyAt - performance.now()));
+    }
+
+    function scheduleFollowingWave(
+      nextWaveIndex: number,
+      previousImpactAt: number,
+      previousDangerKeys: readonly string[],
+      postImpactHoldMs: number,
+    ) {
+      const plan = getZoneTransition(
+        stage,
+        nextWaveIndex,
+        activeKeysRef.current,
+        previousDangerKeys,
+      );
+
+      if (plan.kind !== "none") {
+        const transitionStartAt = performance.now() + postImpactHoldMs;
+        currentZonePlan = plan;
+        scheduleMode = "zone-pending";
+        scheduleDeadlineAt = transitionStartAt;
+        nextTimer = window.setTimeout(
+          () => beginZoneTransition(plan),
+          Math.max(0, transitionStartAt - performance.now()),
+        );
+        return;
       }
 
-      const pattern = getAttackPattern(waveIndex, stage);
+      currentZonePlan = null;
+      setZoneTransition(null);
+      setZoneShift("steady");
+      setCollapseEjection(null);
+      const nextTiming = getNextWaveTiming(
+        stage,
+        nextWaveIndex,
+        previousImpactAt,
+        plan,
+      );
+      nextImpactAt = nextTiming.impactAt;
+      scheduleMode = "between";
+      scheduleDeadlineAt = nextTiming.warningAt;
+      nextTimer = window.setTimeout(
+        () => runAttack(),
+        Math.max(0, nextTiming.warningAt - performance.now()),
+      );
+    }
+
+    function runAttack(restoredWarningStartedAt?: number) {
+      if (cancelled || phaseRef.current !== "running") return;
+      const waveIndex = attackIndexRef.current;
+      const profile = getWaveProfile(stage, waveIndex);
+
+      updateProfile(profile);
+      currentZonePlan = null;
+      setZoneTransition(null);
+      setZoneShift("steady");
+      setCollapseEjection(null);
+
+      const pattern = getAttackPattern(
+        waveIndex,
+        stage,
+        activeKeysRef.current,
+      );
       warningStartedAt = restoredWarningStartedAt ?? performance.now();
       const playerIsTargeted = pattern.targets.includes(playerKeyRef.current);
       const waveVisualToken = ++visualToken;
@@ -630,6 +1140,7 @@ export function KeyboardDodge() {
 
       setTargets(pattern.targets);
       setAttackKind(pattern.kind);
+      setSurfPattern(pattern.surf);
       setSpecialKey(pattern.safeKey ?? pattern.healKey);
       setHealFeedback("idle");
       setAttackState("warning");
@@ -662,7 +1173,7 @@ export function KeyboardDodge() {
 
           if (result.qualified) {
             setHealFeedback(result.full ? "full" : "success");
-            setScore((value) => value + (result.full ? 150 : 300));
+            awardScore(result.full ? 150 : 300);
             playTone(result.full ? 720 : 1040, 0.2, 0.055);
           } else {
             setHealFeedback("miss");
@@ -684,31 +1195,35 @@ export function KeyboardDodge() {
               hpRef.current = nextHp;
               setHp(nextHp);
               setHurt(true);
+              streakRef.current = 0;
               setStreak(0);
+              setComboPopStreak(null);
               fatal = nextHp === 0;
-              if (fatal) {
-                phaseRef.current = "lost";
-                setPhase("lost");
-                playTone(55, 0.35, 0.06);
-              }
               hurtTimer = window.setTimeout(
                 () => setHurt(false),
                 INVULNERABILITY_MS,
               );
             }
           } else {
-            setStreak((current) => {
-              const next = current + 1;
-              playTone(620 + Math.min(next, 12) * 12, 0.045, 0.018);
-              setBestStreak((best) => Math.max(best, next));
-              setScore(
-                (value) =>
-                  value +
-                  (pattern.kind === "last-safe" ? 220 : 100) +
-                  Math.min(next, 20) * 10,
-              );
-              return next;
-            });
+            const nextStreak = streakRef.current + 1;
+            streakRef.current = nextStreak;
+            setStreak(nextStreak);
+            setComboPopStreak(nextStreak);
+            playTone(
+              620 + Math.min(nextStreak, 12) * 12,
+              0.045,
+              0.018,
+            );
+            const nextBestStreak = Math.max(
+              bestStreakRef.current,
+              nextStreak,
+            );
+            bestStreakRef.current = nextBestStreak;
+            setBestStreak(nextBestStreak);
+            awardScore(
+              (pattern.kind === "last-safe" ? 220 : 100) +
+                Math.min(nextStreak, 20) * 10,
+            );
           }
         }
 
@@ -721,10 +1236,18 @@ export function KeyboardDodge() {
           setTargets([]);
           setAttackState("idle");
           setAttackKind("standard");
+          setSurfPattern(null);
           setSpecialKey(null);
-        }, Math.min(180, profile.beatMs * 0.35));
+        }, getImpactHoldMs(profile.beatMs));
 
-        if (fatal) return;
+        if (fatal) {
+          audioDirectorRef.current?.stop();
+          completeRun(stage.id, "game-over", nextCompleted);
+          phaseRef.current = "lost";
+          setPhase("lost");
+          playTone(55, 0.35, 0.06);
+          return;
+        }
 
         if (nextCompleted >= stage.waves) {
           scheduleMode = "finish";
@@ -733,21 +1256,14 @@ export function KeyboardDodge() {
           return;
         }
 
-        const nextTiming = getNextWaveTiming(
-          stage,
+        scheduleFollowingWave(
           nextCompleted,
           nextImpactAt,
-        );
-        nextImpactAt = nextTiming.impactAt;
-        const nextWarningAt = nextTiming.warningAt;
-        scheduleMode = "between";
-        scheduleDeadlineAt = nextWarningAt;
-        nextTimer = window.setTimeout(
-          () => runAttack(),
-          Math.max(0, nextWarningAt - performance.now()),
+          pattern.targets,
+          getImpactHoldMs(profile.beatMs),
         );
       }, Math.max(0, nextImpactAt - performance.now()));
-    };
+    }
 
     const pausedSchedule = pausedAttackRef.current;
     pausedAttackRef.current = null;
@@ -760,6 +1276,28 @@ export function KeyboardDodge() {
       if (pausedSchedule.mode === "warning") {
         nextImpactAt = performance.now() + pausedSchedule.remainingMs;
         runAttack(pausedSchedule.warningStartedAt);
+      } else if (
+        pausedSchedule.mode === "zone-pending" &&
+        pausedSchedule.zoneTransitionPlan
+      ) {
+        const transitionStartAt =
+          performance.now() + pausedSchedule.remainingMs;
+        currentZonePlan = pausedSchedule.zoneTransitionPlan;
+        scheduleMode = "zone-pending";
+        scheduleDeadlineAt = transitionStartAt;
+        nextTimer = window.setTimeout(
+          () => beginZoneTransition(pausedSchedule.zoneTransitionPlan!),
+          pausedSchedule.remainingMs,
+        );
+      } else if (
+        pausedSchedule.mode === "zone-warning" &&
+        pausedSchedule.zoneTransitionPlan
+      ) {
+        beginZoneTransition(
+          pausedSchedule.zoneTransitionPlan,
+          pausedSchedule.remainingMs,
+          false,
+        );
       } else if (pausedSchedule.mode === "between") {
         scheduleMode = "between";
         scheduleDeadlineAt = performance.now() + pausedSchedule.remainingMs;
@@ -790,6 +1328,11 @@ export function KeyboardDodge() {
           mode: scheduleMode,
           remainingMs: Math.max(0, scheduleDeadlineAt - performance.now()),
           warningStartedAt,
+          zoneTransitionPlan:
+            scheduleMode === "zone-warning" ||
+            scheduleMode === "zone-pending"
+              ? currentZonePlan
+              : null,
         };
       } else if (phaseRef.current !== "paused") {
         pausedAttackRef.current = null;
@@ -803,11 +1346,23 @@ export function KeyboardDodge() {
       setTargets([]);
       setAttackState("idle");
       setAttackKind("standard");
+      setSurfPattern(null);
       setSpecialKey(null);
       setHealFeedback("idle");
       setHurt(false);
+      if (phaseRef.current !== "paused") {
+        setZoneTransition(null);
+        setZoneShift("steady");
+      }
     };
-  }, [phase, playTone, selectedStageId]);
+  }, [
+    applyActiveKeys,
+    awardScore,
+    completeRun,
+    phase,
+    playTone,
+    selectedStageId,
+  ]);
 
   const progress = selectedStage
     ? (completedWaves / selectedStage.waves) * 100
@@ -817,19 +1372,51 @@ export function KeyboardDodge() {
     : -1;
   const nextStage =
     selectedStageIndex >= 0 ? (STAGES[selectedStageIndex + 1] ?? null) : null;
+  const clearedStageCount = STAGES.filter(
+    (stage) => localProgress.stages[stage.id].clears > 0,
+  ).length;
+  const focusedStageRecord = focusedStage
+    ? localProgress.stages[focusedStage.id]
+    : null;
+  const runAwardLabels = runReport
+    ? getRunAwardLabels(runReport.newBests)
+    : [];
   const currentBpm = waveProfile?.bpm ?? null;
+  const transitionKeys = zoneTransition?.keys ?? [];
+  const transitionWarning = zoneTransition?.phase === "warning";
+  const playerOnCollapsingKey =
+    transitionWarning &&
+    zoneTransition?.kind === "collapse" &&
+    transitionKeys.includes(playerKey);
+  const transitionLabel = zoneTransition
+    ? zoneTransition.kind === "collapse"
+      ? zoneTransition.phase === "warning"
+        ? "COLLAPSE WARNING · " +
+          transitionKeys.length +
+          (transitionKeys.length === 1 ? " KEY MARKED" : " KEYS MARKED")
+        : "FIELD COLLAPSED · " +
+          zoneTransition.nextKeyCount +
+          " KEYS ACTIVE"
+      : zoneTransition.phase === "warning"
+        ? "RESTORE WARNING · " +
+          transitionKeys.length +
+          (transitionKeys.length === 1
+            ? " KEY CHARGING"
+            : " KEYS CHARGING")
+        : "ZONE RESTORED · " +
+          zoneTransition.nextKeyCount +
+          " KEYS ACTIVE"
+    : "";
   const profileChanges = [
     tempoShift === "up"
       ? "TEMPO UP"
       : tempoShift === "down"
         ? "TEMPO DOWN"
         : "",
-    zoneShift === "expand"
-      ? "ZONE EXPAND"
-      : zoneShift === "contract"
-        ? "ZONE CONTRACT"
-        : "",
-    autoRecentered ? "AUTO RECENTER · KEY_F" : "",
+    transitionLabel,
+    collapseEjection
+      ? `COLLAPSE EJECT · KEY_${collapseEjection.fromKey} → KEY_${collapseEjection.toKey}${collapseEjection.damaged ? " · HP -1" : " · INVULNERABLE"}`
+      : "",
   ]
     .filter(Boolean)
     .join(" · ");
@@ -843,20 +1430,54 @@ export function KeyboardDodge() {
     attackKind === "heal" && attackState === "warning" && specialKey;
   const onlySafeWarning =
     attackKind === "last-safe" && attackState === "warning" && specialKey;
+  const surfWarning = attackState === "warning" && surfPattern !== null;
+  const surfDirectionArrow =
+    surfPattern?.direction === "right-to-left" ? "←" : "→";
+  const surfDirectionCopy =
+    surfPattern?.direction === "right-to-left" ? "오른쪽에서 왼쪽" : "왼쪽에서 오른쪽";
   const readoutState = hurt
     ? "hit"
-    : healWarning || healFeedback === "success" || healFeedback === "full"
-      ? "heal"
-      : healFeedback === "miss"
-        ? "miss"
-        : playerThreatened
-          ? "danger"
-          : attackState === "warning"
-            ? "safe"
-            : "";
+    : zoneTransition?.kind === "collapse"
+      ? "collapse"
+      : zoneTransition?.kind === "restore"
+        ? "restore"
+        : healWarning || healFeedback === "success" || healFeedback === "full"
+          ? "heal"
+          : healFeedback === "miss"
+            ? "miss"
+            : playerThreatened
+              ? "danger"
+              : surfWarning
+                ? "surf"
+              : attackState === "warning"
+                ? "safe"
+                : "";
+  const beatDotState = hurt
+    ? "impact"
+    : transitionWarning
+      ? zoneTransition?.kind === "collapse"
+        ? "collapse-warning"
+        : "restore-warning"
+      : surfWarning
+        ? "surf-warning"
+      : attackState;
   const dangerLabel = hurt
-    ? `HIT! · KEY_${playerKey} 피격 · HP ${hp}/${MAX_HP}`
-    : healFeedback === "success"
+    ? collapseEjection?.damaged
+      ? `COLLAPSE HIT! · KEY_${collapseEjection.fromKey} 붕괴 · KEY_${collapseEjection.toKey}로 밀려남 · HP ${hp}/${MAX_HP}`
+      : `HIT! · KEY_${playerKey} 피격 · HP ${hp}/${MAX_HP}`
+    : transitionWarning && zoneTransition?.kind === "collapse"
+      ? playerOnCollapsingKey
+        ? `KEY_${playerKey} 붕괴 예정 · 경고가 끝나기 전에 이동하세요`
+        : `COLLAPSE WARNING · 직전 위험 키 ${transitionKeys.length}개가 곧 사라집니다`
+      : transitionWarning && zoneTransition?.kind === "restore"
+        ? `RESTORE WARNING · 비활성 키 ${transitionKeys.length}개가 곧 열립니다`
+        : collapseEjection
+          ? `COLLAPSE EJECT · KEY_${collapseEjection.toKey}로 이동${collapseEjection.damaged ? " · HP -1" : " · 무적 유지"}`
+          : zoneTransition?.kind === "collapse"
+            ? `FIELD COLLAPSED · ${zoneTransition.nextKeyCount}개 키로 계속`
+          : zoneTransition?.kind === "restore"
+            ? `ZONE RESTORED · ${zoneTransition.nextKeyCount}개 키 사용 가능`
+            : healFeedback === "success"
       ? `RECOVERED · HP +1 · ${hp}/${MAX_HP}`
       : healFeedback === "full"
         ? `HP FULL · 회복 키 입력 성공 · ${hp}/${MAX_HP}`
@@ -868,6 +1489,8 @@ export function KeyboardDodge() {
               ? playerKey === specialKey
                 ? `KEY_${specialKey}만 안전 · 현재 위치 유지`
                 : `KEY_${specialKey}만 안전 · 즉시 이동!`
+              : surfWarning && surfPattern
+                ? `WAVE SURGE ${surfDirectionArrow} · ${surfDirectionCopy} ${surfPattern.step + 1}/${surfPattern.totalSteps}${playerThreatened ? ` · KEY_${playerKey} MOVE!` : ` · KEY_${playerKey} 안전`}`
               : playerThreatened
                 ? `현재 위치 KEY_${playerKey} 공격 대상 · MOVE!`
                 : attackState === "warning"
@@ -881,43 +1504,58 @@ export function KeyboardDodge() {
 
   if (phase === "title") {
     return (
-      <main className="entry-shell title-entry">
+      <>
+      <main className="entry-shell title-entry" data-theme={themeId}>
         <div className="ambient-grid" aria-hidden="true" />
-        <div className="title-corner top-left" aria-hidden="true">SYS.KEYDODGE</div>
-        <div className="title-corner top-right" aria-hidden="true">PHYSICAL INPUT REQUIRED</div>
+        <header className="screen-chrome">
+          <span className="screen-chrome-dots" aria-hidden="true"><i /><i /><i /></span>
+          <strong>{currentTheme.displayName.toUpperCase()} INTERFACE</strong>
+          <span>TITLE // 00</span>
+          <button
+            className="theme-settings-trigger"
+            type="button"
+            onClick={openThemeSettings}
+            aria-haspopup="dialog"
+          >
+            THEME
+          </button>
+        </header>
 
         <section className="title-hero" aria-labelledby="game-title">
-          <p className="title-kicker">QWERTY RHYTHM ACTION / 06 STAGES</p>
+          <p className="title-kicker">QWERTY RHYTHM ACTION</p>
           <h1 id="game-title" className="title-logo">
-            <span>KEY</span><i>{"//"}</i><span>DODGE</span>
+            <span>KEYBOARD</span><span className="title-logo-accent">DODGE</span>
           </h1>
+          <p className="title-system-line">QWERTY RHYTHM DODGE</p>
           <p className="title-copy">
             실제 키보드를 전장으로 바꾸세요.<br />
             감속·가속 신호와 확장·축소되는 키 존을 읽고 스테이지를 돌파합니다.
           </p>
 
-          <div className="title-specs" aria-label="게임 구성">
-            <span><b>06</b> STAGES</span>
-            <span><b>05—26</b> KEYS</span>
-            <span><b>82—156</b> BPM</span>
-          </div>
-
           <button className="title-start" type="button" onClick={enterStageSelect}>
-            <span>STAGE MAP 열기</span>
+            <span>게임 시작</span>
             <kbd>SPACE / ENTER</kbd>
           </button>
           <p className="title-hint">물리 키보드가 있는 데스크톱 환경을 권장합니다.</p>
         </section>
 
-        <div className="title-corner bottom-left" aria-hidden="true">BUILD 0.5 / LOCAL</div>
+        <div className="title-corner bottom-left" aria-hidden="true">KEY//DODGE</div>
         <div className="title-corner bottom-right" aria-hidden="true">PRESS START</div>
       </main>
+      <ThemeSettings
+        open={settingsOpen}
+        selectedThemeId={themeId}
+        onSelect={applyTheme}
+        onClose={closeThemeSettings}
+      />
+      </>
     );
   }
 
   if (phase === "select") {
     return (
-      <main className="entry-shell stage-select-shell">
+      <>
+      <main className="entry-shell stage-select-shell" data-theme={themeId}>
         <div className="ambient-grid" aria-hidden="true" />
         <header className="stage-select-topbar">
           <button className="back-button" type="button" onClick={showTitle}>
@@ -926,23 +1564,35 @@ export function KeyboardDodge() {
           <div className="stage-select-brand">
             KEY<span>{"//"}</span>DODGE
           </div>
-          <button
-            className="icon-button"
-            type="button"
-            onClick={toggleMuted}
-            aria-label={muted ? "소리 켜기" : "소리 끄기"}
-          >
-            {muted ? "MUTED" : "SOUND"}
-          </button>
+          <div className="stage-select-actions topbar-actions">
+            <button
+              className="theme-settings-trigger"
+              type="button"
+              onClick={openThemeSettings}
+              aria-haspopup="dialog"
+              aria-label={`테마 설정, 현재 ${currentTheme.displayName}`}
+            >
+              THEME<span aria-hidden="true"> / {currentTheme.displayName}</span>
+            </button>
+            <button
+              className="icon-button"
+              type="button"
+              onClick={toggleMuted}
+              aria-label={muted ? "소리 켜기" : "소리 끄기"}
+            >
+              {muted ? "MUTED" : "SOUND"}
+            </button>
+          </div>
         </header>
 
         <section className="stage-map-shell" aria-labelledby="stage-map-title">
           <div className="stage-map-intro">
-            <p className="overlay-code">STAGE_SELECT</p>
-            <h2 id="stage-map-title">공략할<br />스테이지를 선택하세요</h2>
-            <p>
+            <p className="overlay-code">SELECT YOUR RUN</p>
+            <h2 id="stage-map-title">스테이지<br />선택</h2>
+            <p id="stage-selection-instructions">
               Q부터 Y까지 한 번 누르면 스테이지가 강조됩니다. 같은 키를 한 번
-              더 눌러 확정하세요. 플레이 중 BPM과 활성 키 존이 구간마다 변합니다.
+              더 눌러 확정하세요. 각 스테이지는 약 2분 동안 BPM과 활성 키 존이
+              공격 흐름에 맞춰 변합니다.
             </p>
             <div className="stage-controls" aria-label="스테이지 선택 조작">
               <span><kbd>QWERTY</kbd> FOCUS / CONFIRM</span>
@@ -951,61 +1601,117 @@ export function KeyboardDodge() {
             </div>
           </div>
 
-          <div className="stage-track" aria-label="스테이지 목록">
-            {STAGES.map((stage) => {
-              const focused = focusedStageId === stage.id;
-              const keyRange = getStageKeyRange(stage);
-              const tempoRange = getStageTempoRange(stage);
-              return (
-                <button
-                  type="button"
-                  data-stage-id={stage.id}
-                  className={`stage-card stage-${stage.id} ${focused ? "is-focused" : ""}`}
+          <div className="stage-carousel">
+            <div className="stage-carousel-head" aria-live="polite">
+              <strong>
+                {focusedStage
+                  ? `${focusedStage.code} / ${focusedStage.name}`
+                  : "MISSION DECK / 06"}
+              </strong>
+              <span>
+                {focusedStage && focusedStageRecord
+                  ? focusedStageRecord.attempts > 0
+                    ? `BEST ${focusedStageRecord.bestGrade ?? "—"} · ${focusedStageRecord.bestScore.toLocaleString()}`
+                    : "NEW MISSION · PRESS AGAIN"
+                  : `${clearedStageCount}/06 CLEARED · ALL OPEN`}
+              </span>
+            </div>
+
+            <div
+              ref={stageTrackRef}
+              className={`stage-track ${focusedStageId ? "has-focus" : ""}`}
+              aria-label="왼쪽부터 오른쪽으로 이어지는 스테이지 카드 목록"
+              aria-describedby="stage-selection-instructions"
+            >
+              {STAGES.map((stage) => {
+                const focused = focusedStageId === stage.id;
+                const keyRange = getStageKeyRange(stage);
+                const tempoRange = getStageTempoRange(stage);
+                const stageRecord = localProgress.stages[stage.id];
+                return (
+                  <button
+                    type="button"
+                    data-stage-id={stage.id}
+                    className={`stage-card stage-${stage.id} ${focused ? "is-focused" : ""}`}
+                    key={stage.id}
+                    onClick={() => chooseStage(stage.id)}
+                    aria-pressed={focused}
+                  >
+                    <span className="stage-number">{stage.code}</span>
+                    <kbd className="stage-hotkey">{stage.selectKey}</kbd>
+                    <strong>{stage.name}</strong>
+                    <em>{stage.koreanName}</em>
+                    <span className="stage-description">{stage.description}</span>
+                    <span
+                      className={`stage-record ${stageRecord.clears > 0 ? "has-clear" : ""}`}
+                    >
+                      {stageRecord.clears > 0
+                        ? `CLEAR ×${stageRecord.clears} · BEST ${stageRecord.bestGrade ?? "—"}`
+                        : stageRecord.attempts > 0
+                          ? `BEST ${stageRecord.bestCompletedWaves}/${stage.waves} · ${stageRecord.bestGrade ?? "—"}`
+                          : "NEW MISSION · ALL STAGES OPEN"}
+                    </span>
+                    <span className="stage-metrics">
+                      <b>{keyRange.min}↔{keyRange.max}<small> KEYS</small></b>
+                      <b>{stage.waves}<small> WAVES</small></b>
+                      <b>{tempoRange.min}—{tempoRange.max}<small> BPM</small></b>
+                      <b>{formatStageDuration(getStageDurationMs(stage))}<small> RUN</small></b>
+                    </span>
+                    <span className="stage-enter">
+                      {focused
+                        ? `PRESS ${stage.selectKey} AGAIN TO START`
+                        : `PRESS ${stage.selectKey} TO FOCUS`}
+                      <i>→</i>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="stage-deck-index" aria-hidden="true">
+              {STAGES.map((stage) => (
+                <span
+                  className={focusedStageId === stage.id ? "is-focused" : ""}
                   key={stage.id}
-                  onClick={() => chooseStage(stage.id)}
-                  aria-pressed={focused}
                 >
-                  <span className="stage-number">{stage.code}</span>
-                  <kbd className="stage-hotkey">{stage.selectKey}</kbd>
-                  <strong>{stage.name}</strong>
-                  <em>{stage.koreanName}</em>
-                  <span className="stage-description">{stage.description}</span>
-                  <span className="stage-metrics">
-                    <b>{keyRange.min}↔{keyRange.max}<small> KEYS</small></b>
-                    <b>{stage.waves}<small> WAVES</small></b>
-                    <b>{tempoRange.min}—{tempoRange.max}<small> BPM</small></b>
-                  </span>
-                  <span className="stage-enter">
-                    {focused
-                      ? `PRESS ${stage.selectKey} AGAIN TO START`
-                      : `PRESS ${stage.selectKey} TO FOCUS`}
-                    <i>→</i>
-                  </span>
-                </button>
-              );
-            })}
+                  {stage.selectKey}
+                </span>
+              ))}
+            </div>
           </div>
         </section>
 
         <footer className="stage-select-footer">
           <span>
             {focusedStage
-              ? `${focusedStage.code} ARMED · ${getStageTempoRange(focusedStage).min}—${getStageTempoRange(focusedStage).max} BPM · VARIABLE ZONES`
-              : "NO STAGE FOCUSED · PRESS Q / W / E / R / T / Y"}
+              ? `${focusedStage.code} ARMED · ${focusedStageRecord?.attempts ?? 0} RUNS · ${focusedStageRecord?.clears ?? 0} CLEARS`
+              : `${clearedStageCount}/06 CLEARED · PRESS Q / W / E / R / T / Y`}
           </span>
           <span>FIRST PRESS = FOCUS · SECOND PRESS = START</span>
         </footer>
       </main>
+      <ThemeSettings
+        open={settingsOpen}
+        selectedThemeId={themeId}
+        onSelect={applyTheme}
+        onClose={closeThemeSettings}
+      />
+      </>
     );
   }
 
   return (
+    <>
     <main
-      className={`game-shell ${hurt ? "is-hurt" : ""} ${playerThreatened ? "is-threatened" : ""}`}
+      className={`game-shell ${hurt ? "is-hurt" : ""} ${playerThreatened ? "is-threatened" : ""} ${playerOnCollapsingKey ? "is-zone-threatened" : ""} ${waveProfile && selectedStage && waveProfile.sectionIndex === selectedStage.sections.length - 1 ? "is-final-act" : ""}`}
+      data-theme={themeId}
       style={
         {
           "--current-beat": `${waveProfile?.beatMs ?? 500}ms`,
           "--warning-pulse": `${(waveProfile?.beatMs ?? 500) / 2}ms`,
+          "--stage-identity": selectedStage
+            ? `var(--theme-stage-${selectedStage.id})`
+            : "var(--theme-accent)",
         } as CSSProperties
       }
     >
@@ -1022,8 +1728,25 @@ export function KeyboardDodge() {
         <div className="topbar-actions">
           <span className={`status-light ${phase === "running" || phase === "countdown" ? "active" : ""}`}>
             <i aria-hidden="true" />
-            {phase === "running" ? "LIVE" : phase === "countdown" ? "SYNC" : "STANDBY"}
+            {phase === "running"
+              ? "RUN"
+              : phase === "countdown"
+                ? "READY"
+                : phase === "paused"
+                  ? "PAUSED"
+                  : "RESULT"}
           </span>
+          <button
+            className="theme-settings-trigger"
+            type="button"
+            onClick={openThemeSettings}
+            disabled={phase === "countdown"}
+            aria-haspopup="dialog"
+            aria-label={`테마 설정, 현재 ${currentTheme.displayName}`}
+            title={phase === "countdown" ? "카운트다운 뒤 설정할 수 있습니다" : undefined}
+          >
+            THEME<span aria-hidden="true"> / {currentTheme.displayName}</span>
+          </button>
           <button
             className="icon-button"
             type="button"
@@ -1035,29 +1758,71 @@ export function KeyboardDodge() {
         </div>
       </header>
 
-      <section className="play-layout" aria-label="게임 화면">
-        <aside className="stat-panel">
-          <div className="stat-block health-block">
-            <p>INTEGRITY</p>
-            <div className="hearts" aria-label={`체력 ${hp} / ${MAX_HP}`}>
-              {Array.from({ length: MAX_HP }).map((_, index) => (
-                <span key={index} className={index < hp ? "filled" : ""}>
-                  {index < hp ? "◆" : "◇"}
-                </span>
-              ))}
+      <section className="instrument-hud" aria-label="현재 스테이지 상태">
+        <div className="hud-cell">
+          <span className="hud-cell-label">COMBO</span>
+          <strong className="hud-cell-value">
+            ×{streak}<small> BEST {bestStreak}</small>
+          </strong>
+        </div>
+        <div className="hud-cell">
+          <span className="hud-cell-label">WAVE</span>
+          <strong className="hud-cell-value">
+            {completedWaves.toString().padStart(2, "0")} / {selectedStage?.waves ?? "—"}
+          </strong>
+        </div>
+        <div className="hud-cell">
+          <span className="hud-cell-label">SCORE</span>
+          <strong className="hud-cell-value">{score.toString().padStart(6, "0")}</strong>
+        </div>
+        <div className="hud-cell hud-health">
+          <span className="hud-cell-label">HP</span>
+          <strong className="hud-cell-value" aria-label={`체력 ${hp} / ${MAX_HP}`}>
+            {Array.from({ length: MAX_HP }).map((_, index) => (
+              <i key={index} className={index < hp ? "filled" : ""} aria-hidden="true" />
+            ))}
+          </strong>
+        </div>
+        <div className="hud-cell">
+          <span className="hud-cell-label">BPM</span>
+          <strong className="hud-cell-value">{currentBpm ?? "—"}</strong>
+        </div>
+        <div className="hud-cell hud-section">
+          <span className="hud-cell-label">SECTION</span>
+          <strong className="hud-cell-value">
+            {waveProfile?.sectionName ?? "OPENING"}<small> SCORE SYNC</small>
+          </strong>
+        </div>
+        <div className="hud-cell">
+          <span className="hud-cell-label">ACTIVE ZONE</span>
+          <strong className="hud-cell-value">{activeKeys.length}<small> KEYS</small></strong>
+        </div>
+        <div className="hud-cell hud-progress">
+          <span className="hud-cell-label">REMAINING</span>
+          <strong className="hud-cell-value">{Math.max(0, Math.round(100 - progress))}%</strong>
+          <span className="hud-progress-track" aria-hidden="true">
+            <i className="hud-progress-fill" style={{ width: `${progress}%` }} />
+          </span>
+          {phase === "running" && comboPopStreak !== null && (
+            <div
+              className="combo-pop"
+              key={`combo-${comboPopStreak}`}
+              role="status"
+              aria-live="polite"
+              onAnimationEnd={() => {
+                setComboPopStreak((visibleStreak) =>
+                  visibleStreak === comboPopStreak ? null : visibleStreak,
+                );
+              }}
+            >
+              <small>PERFECT DODGE</small>
+              <strong>{comboPopStreak} COMBO!</strong>
             </div>
-          </div>
-          <div className="stat-block score-block">
-            <p>SCORE</p>
-            <strong>{score.toString().padStart(6, "0")}</strong>
-          </div>
-          <div className="stat-block">
-            <p>STREAK</p>
-            <strong className="accent">{streak}<small>x</small></strong>
-            <span>BEST {bestStreak}</span>
-          </div>
-        </aside>
+          )}
+        </div>
+      </section>
 
+      <section className="play-layout" aria-label="게임 화면">
         <div className="arena-wrap">
           <div
             className="timeline"
@@ -1079,6 +1844,29 @@ export function KeyboardDodge() {
                   : "— / —"}
               </strong>
             </div>
+            {phase === "running" &&
+              waveProfile?.isSectionStart &&
+              waveProfile.waveIndex === completedWaves &&
+              completedWaves > 0 &&
+              selectedStage && (
+                <div
+                  className={`act-transition ${waveProfile.sectionIndex === selectedStage.sections.length - 1 ? "is-finale" : ""}`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  <span>ACT {waveProfile.sectionIndex + 1} / {selectedStage.sections.length}</span>
+                  <strong>{waveProfile.sectionName}</strong>
+                  <em>
+                    {waveProfile.sectionIndex === selectedStage.sections.length - 1
+                      ? "FINAL SEQUENCE"
+                      : tempoShift === "up"
+                        ? "TEMPO RISING"
+                        : tempoShift === "down"
+                          ? "TEMPO BREAK"
+                          : "FIELD SHIFT"}
+                  </em>
+                </div>
+              )}
             <div className="timeline-track">
               <span style={{ width: `${progress}%` }} />
             </div>
@@ -1091,15 +1879,63 @@ export function KeyboardDodge() {
               aria-live="polite"
             >
               <span
-                className={`beat-dot ${hurt ? "impact" : attackState}`}
+                className={`beat-dot ${beatDotState}`}
                 aria-hidden="true"
               />
               {dangerLabel}
             </div>
 
             <div
-              className={`keyboard-frame ${zoneShift === "expand" ? "zone-expand" : zoneShift === "contract" ? "zone-contract" : ""}`}
+              className={`keyboard-frame ${zoneShift === "expand" ? "zone-expand" : zoneShift === "contract" ? "zone-contract" : ""} ${zoneTransition ? `zone-transition-${zoneTransition.kind} zone-${zoneTransition.phase}` : ""} ${surfWarning && surfPattern ? `surf-warning surf-${surfPattern.direction}` : ""}`}
+              data-surf-step={surfWarning && surfPattern ? surfPattern.step + 1 : undefined}
+              style={
+                surfWarning && surfPattern
+                  ? ({
+                      "--surf-left": `${surfPattern.leftPercent}%`,
+                      "--surf-width": `${surfPattern.widthPercent}%`,
+                    } as CSSProperties)
+                  : undefined
+              }
             >
+              {phase === "countdown" && selectedStage && (
+                <div
+                  className="countdown-badge"
+                  style={
+                    {
+                      "--countdown-beat": `${getBeatMs(selectedStage, 0)}ms`,
+                    } as CSSProperties
+                  }
+                  role="group"
+                  aria-label="시작 전 준비 이동, 현재 활성 키로 위치를 정할 수 있습니다"
+                >
+                  <span className="countdown-copy" aria-hidden="true">
+                    <b>{selectedStage.code}</b>
+                    <small>PREP MOVE</small>
+                  </span>
+                  <strong
+                    className="countdown-number"
+                    key={countdownValue}
+                    role="status"
+                    aria-live="assertive"
+                    aria-atomic="true"
+                    aria-label={`게임 시작까지 ${countdownValue}박`}
+                  >
+                    {countdownValue}
+                  </strong>
+                  <span className="countdown-copy countdown-tempo" aria-hidden="true">
+                    <b>{getWaveProfile(selectedStage, 0).bpm} BPM</b>
+                    <small>ACTIVE KEYS MOVE</small>
+                  </span>
+                  <button
+                    type="button"
+                    className="countdown-cancel"
+                    onClick={cancelCountdown}
+                    aria-label="카운트다운 취소하고 스테이지 선택으로 돌아가기"
+                  >
+                    <kbd>ESC</kbd>
+                  </button>
+                </div>
+              )}
               <div className="keyboard-labels">
                 <span className="profile-live">
                   {selectedStage
@@ -1117,12 +1953,24 @@ export function KeyboardDodge() {
                 </span>
               </div>
               <div className="keyboard" role="group" aria-label="QWERTY 게임 보드">
+                {surfWarning && surfPattern && (
+                  <span className="surf-signal" aria-hidden="true">
+                    <i />
+                  </span>
+                )}
                 {KEY_ROWS.map((row, rowIndex) => (
                   <div className={`key-row row-${rowIndex}`} key={row.join("")}>
                     {row.map((key) => {
                       const active = activeKeys.includes(key);
                       const targeted = targets.includes(key);
                       const isPlayer = playerKey === key;
+                      const isTransitionKey = transitionKeys.includes(key);
+                      const isCollapsing =
+                        isTransitionKey &&
+                        zoneTransition?.kind === "collapse";
+                      const isRestoring =
+                        isTransitionKey &&
+                        zoneTransition?.kind === "restore";
                       const isOnlySafe =
                         key === specialKey &&
                         attackKind === "last-safe" &&
@@ -1145,6 +1993,18 @@ export function KeyboardDodge() {
                           : "",
                         isPlayer && playerUnderImpact ? "player-impact" : "",
                         isPlayer && hurt ? "damaged" : "",
+                        isCollapsing && transitionWarning
+                          ? "collapse-warning"
+                          : "",
+                        isCollapsing && !transitionWarning
+                          ? "collapse-applied"
+                          : "",
+                        isRestoring && transitionWarning
+                          ? "restore-warning"
+                          : "",
+                        isRestoring && !transitionWarning
+                          ? "restore-applied"
+                          : "",
                       ]
                         .filter(Boolean)
                         .join(" ");
@@ -1156,7 +2016,7 @@ export function KeyboardDodge() {
                           className={classes}
                           key={key}
                           onClick={() => moveTo(key)}
-                          aria-label={`${key} 키${active ? "" : ", 비활성"}${isPlayer && active ? ", 현재 위치" : ""}${targeted ? ", 위험" : ""}${isOnlySafe ? ", 유일한 안전 키" : ""}${isHealKey ? ", 회복 키" : ""}`}
+                          aria-label={`${key} 키${active ? "" : ", 비활성"}${isPlayer && active ? ", 현재 위치" : ""}${targeted ? ", 위험" : ""}${isOnlySafe ? ", 유일한 안전 키" : ""}${isHealKey ? ", 회복 키" : ""}${isCollapsing ? (transitionWarning ? ", 붕괴 예정" : ", 붕괴됨") : ""}${isRestoring ? (transitionWarning ? ", 복원 예정" : ", 복원됨") : ""}`}
                         >
                           <span className="key-letter">{key}</span>
                           <span className="key-code">{key.charCodeAt(0)}</span>
@@ -1183,6 +2043,16 @@ export function KeyboardDodge() {
                               +1 HP
                             </span>
                           )}
+                          {isCollapsing && transitionWarning && (
+                            <span className="collapse-callout" aria-hidden="true">
+                              COLLAPSE
+                            </span>
+                          )}
+                          {isRestoring && transitionWarning && (
+                            <span className="restore-callout" aria-hidden="true">
+                              RESTORE
+                            </span>
+                          )}
                         </button>
                       );
                     })}
@@ -1197,44 +2067,11 @@ export function KeyboardDodge() {
               </div>
             </div>
 
-            {phase === "countdown" && selectedStage && (
-              <div className="game-overlay countdown-overlay">
-                <div
-                  className="countdown-card"
-                  style={
-                    {
-                      "--countdown-beat": `${getBeatMs(selectedStage, 0)}ms`,
-                    } as CSSProperties
-                  }
-                >
-                  <p className="overlay-code">
-                    {selectedStage.code} / TEMPO SYNC
-                  </p>
-                  <div
-                    className="countdown-number"
-                    key={countdownValue}
-                    role="status"
-                    aria-live="assertive"
-                    aria-atomic="true"
-                  >
-                    {countdownValue}
-                  </div>
-                  <strong>{getWaveProfile(selectedStage, 0).bpm} BPM · OPENING</strong>
-                  <p>오프닝 템포로 3박 카운트 · 이후 구간마다 속도와 키 존이 변합니다.</p>
-                  <button
-                    type="button"
-                    className="countdown-cancel"
-                    onClick={cancelCountdown}
-                  >
-                    <kbd>ESC</kbd> 스테이지 선택으로
-                  </button>
-                </div>
-              </div>
-            )}
-
             {phase !== "running" && phase !== "countdown" && (
               <div className="game-overlay">
-                <div className="overlay-card">
+                <div
+                  className={`overlay-card ${phase === "won" || phase === "lost" ? "has-run-report" : ""} ${phase === "won" ? "is-cleared" : phase === "lost" ? "is-failed" : ""}`}
+                >
                   <p className="overlay-code">{phase.toUpperCase()}</p>
                   <h2>
                     {phase === "paused" && <>일시정지</>}
@@ -1244,10 +2081,55 @@ export function KeyboardDodge() {
                   <p className="overlay-description">
                     {phase === "paused" && "준비되면 ESC를 눌러 계속하세요."}
                     {phase === "won" && selectedStage &&
-                      `${selectedStage.code} ${selectedStage.name} 클리어 · ${getStageTempoRange(selectedStage).min}—${getStageTempoRange(selectedStage).max} BPM · 점수 ${score.toLocaleString()} · 최고 연속 회피 ${bestStreak}`}
+                      `${selectedStage.code} ${selectedStage.name}의 모든 ACT를 돌파했습니다.`}
                     {phase === "lost" && selectedStage &&
-                      `${selectedStage.code} ${completedWaves}/${selectedStage.waves} 완료 · 점수 ${score.toLocaleString()}`}
+                      `${selectedStage.code} ${completedWaves}/${selectedStage.waves}까지 도달했습니다. 기록을 확인하고 다시 출격하세요.`}
                   </p>
+                  {(phase === "won" || phase === "lost") && runReport && (
+                    <section
+                      className={`run-report grade-${runReport.rankedRun.grade.toLowerCase()}`}
+                      aria-label="런 결과"
+                    >
+                      <div className="run-grade">
+                        <span>RUN GRADE</span>
+                        <strong>{runReport.rankedRun.grade}</strong>
+                        <small>{runReport.rankedRun.rating} / 100</small>
+                      </div>
+                      <dl className="run-report-stats">
+                        <div>
+                          <dt>SCORE</dt>
+                          <dd>{runReport.rankedRun.score.toLocaleString()}</dd>
+                        </div>
+                        <div>
+                          <dt>BEST COMBO</dt>
+                          <dd>{runReport.rankedRun.bestCombo}</dd>
+                        </div>
+                        <div>
+                          <dt>HP LEFT</dt>
+                          <dd>{runReport.rankedRun.remainingHp} / {MAX_HP}</dd>
+                        </div>
+                        <div>
+                          <dt>WAVES</dt>
+                          <dd>
+                            {runReport.rankedRun.completedWaves} / {selectedStage?.waves ?? "—"}
+                          </dd>
+                        </div>
+                      </dl>
+                      <div className="run-awards" aria-label="새 기록">
+                        {(runAwardLabels.length > 0
+                          ? runAwardLabels
+                          : ["RUN RECORDED"]
+                        ).map((label) => (
+                          <span key={label}>{label}</span>
+                        ))}
+                      </div>
+                      {phase === "won" && nextStage && (
+                        <p className="run-next-mission">
+                          NEXT MISSION · {nextStage.code} {nextStage.name}
+                        </p>
+                      )}
+                    </section>
+                  )}
                   <div className="result-actions">
                     <button
                       type="button"
@@ -1291,28 +2173,20 @@ export function KeyboardDodge() {
             )}
           </div>
         </div>
-
-        <aside className="guide-panel">
-          <p className="panel-title">SEQUENCE RULES</p>
-          <ol>
-            <li><b>01</b><span><strong>LIVE TEMPO</strong>같은 스테이지 안에서도 감속과 가속 발생</span></li>
-            <li><b>02</b><span><strong>ZONE SHIFT</strong>패턴 구간에 따라 활성 키가 확장·축소</span></li>
-            <li><b>03</b><span><strong>ONLY SAFE</strong>상위 스테이지는 단 하나의 안전 키로 이동</span></li>
-            <li><b>04</b><span><strong>HEAL +1</strong>희귀한 파랑/초록 키를 예고 중 직접 입력</span></li>
-          </ol>
-          <div className="control-legend">
-            <span><kbd>A–Z</kbd> MOVE</span>
-            <span><kbd>ESC</kbd> PAUSE</span>
-            <span><kbd>0</kbd> SOUND</span>
-          </div>
-        </aside>
       </section>
 
       <footer className="game-footer">
-        <span>PROTOTYPE BUILD 0.5</span>
-        <span className="footer-message">모든 웨이브를 돌파하면 스테이지가 클리어됩니다.</span>
-        <span>KEYBOARD EVENT: CODE</span>
+        <span>{selectedStage ? `${selectedStage.code} · ${selectedStage.name}` : "KEY//DODGE"}</span>
+        <span className="footer-message">ORIGINAL PROCEDURAL SCORE · A–Z MOVE · ESC PAUSE · 0 SOUND</span>
+        <span>PHYSICAL INPUT MODE</span>
       </footer>
     </main>
+    <ThemeSettings
+      open={settingsOpen}
+      selectedThemeId={themeId}
+      onSelect={applyTheme}
+      onClose={closeThemeSettings}
+    />
+    </>
   );
 }
